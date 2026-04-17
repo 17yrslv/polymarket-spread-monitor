@@ -32,9 +32,9 @@ from aiogram.enums import ParseMode
 # КОНФИГУРАЦИЯ
 # ============================================================================
 
-BOT_TOKEN = "8529579028:AAFUnrwpS-CGA-xJDzidLPZ4_FctPulQ82c"
-PROXY_URL = "http://hGrtYkGz:RhnYhNJF@92.119.163.157:62254"
-ALLOWED_USER_ID = 6728174404
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+PROXY_URL = os.getenv("PROXY_URL", "")
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 MAX_MARKETS = 5
 MONITORING_INTERVAL = 10  # секунд
 
