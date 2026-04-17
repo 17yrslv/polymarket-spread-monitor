@@ -17,7 +17,14 @@ from aiohttp_socks import ProxyConnector
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
@@ -176,19 +183,40 @@ class PolymarketAPI:
         return await self.get_market_by_slug(market_slug)
     
     @staticmethod
-    def calculate_spread(market_data: Dict) -> float:
-        """Рассчитать bid-ask спред в процентах"""
+    def calculate_spread(market_data: Dict) -> Tuple[float, str]:
+        """Рассчитать bid-ask спред для исхода YES
+        
+        Формула: ((bestAsk - bestBid) / bestBid) * 100
+        
+        Логика:
+        - bestBid - лучшая цена покупки YES
+        - bestAsk - лучшая цена продажи YES
+        - Минимальная цена: 0.03 (3 цента)
+        - Пример: bestBid=0.54, bestAsk=0.55: ((0.55-0.54)/0.54)*100 = 1.85%
+        
+        Returns:
+            Tuple[float, str]: (spread, "Yes")
+        """
         try:
             best_bid = float(market_data.get("bestBid", 0))
             best_ask = float(market_data.get("bestAsk", 0))
             
-            if best_bid == 0:
-                return 0.0
+            # Проверка на нулевые значения
+            if best_bid == 0 or best_ask == 0:
+                return 0.0, "Unknown"
             
+            # Проверка минимальной цены (3 цента)
+            if best_bid < 0.03 or best_ask < 0.03:
+                return 0.0, "Unknown"
+            
+            # Формула: ((bestAsk - bestBid) / bestBid) * 100
             spread = ((best_ask - best_bid) / best_bid) * 100
-            return round(spread, 2)
-        except (ValueError, TypeError, ZeroDivisionError):
-            return 0.0
+            
+            return round(spread, 2), "Yes"
+                
+        except (ValueError, TypeError, ZeroDivisionError) as e:
+            logger.error(f"Error calculating spread: {e}")
+            return 0.0, "Unknown"
     
     async def get_markets_by_categories(self, categories: List[str], limit: int = AUTO_SCAN_MAX_MARKETS) -> List[Dict]:
         """Получить рынки по категориям (groupItemTitle)"""
@@ -687,10 +715,10 @@ class MonitoringService:
                             logger.warning(f"No data for market {market['market_slug']}")
                             continue
                         
-                        spread = self.api.calculate_spread(data)
+                        spread, outcome = self.api.calculate_spread(data)
                         
                         if self._check_filters(data, spread, filters):
-                            await self._send_notification(user_id, data, spread)
+                            await self._send_notification(user_id, data, spread, outcome)
                     
                     except Exception as e:
                         logger.error(f"Error processing market {market['market_slug']}: {e}")
@@ -743,10 +771,11 @@ class MonitoringService:
         
         return True
     
-    async def _send_notification(self, user_id: int, data: Dict, spread: float):
+    async def _send_notification(self, user_id: int, data: Dict, spread: float, outcome: str):
         """Отправить уведомление пользователю"""
         try:
             question = data.get("question", "Unknown Market")
+            slug = data.get("slug", "")
             best_bid = float(data.get("bestBid", 0))
             best_ask = float(data.get("bestAsk", 0))
             volume = float(data.get("volume", 0))
@@ -762,14 +791,32 @@ class MonitoringService:
             
             current_time = datetime.now().strftime("%H:%M:%S")
             
+            # Формируем ссылку на маркет
+            events = data.get("events", [])
+            if isinstance(events, str):
+                import json
+                events = json.loads(events)
+            
+            if events and len(events) > 0 and slug:
+                event_slug = events[0].get("slug", "")
+                market_url = f"https://polymarket.com/event/{event_slug}/{slug}"
+            elif slug:
+                market_url = f"https://polymarket.com/event/{slug}"
+            else:
+                market_url = ""
+            
             message = (
                 f"🏛️ Рынок: {question}\n"
-                f"📊 Спред: {spread}% (Bid-Ask)\n"
+                f"📊 Спред: {spread}% ({outcome})\n"
                 f"Yes: {yes_price:.3f} | No: {no_price:.3f}\n"
                 f"Объём: ${volume:,.0f}\n"
                 f"Ликвидность: ${liquidity:,.0f}\n"
-                f"Последнее обновление: {current_time}"
             )
+            
+            if market_url:
+                message += f"🔗 Ссылка: {market_url}\n"
+            
+            message += f"Последнее обновление: {current_time}"
             
             await self.bot.send_message(user_id, message)
         
@@ -884,7 +931,7 @@ class AutoScanService:
                 return
             
             # Рассчитываем спред
-            spread = self.api.calculate_spread(market)
+            spread, outcome = self.api.calculate_spread(market)
             
             # Проверяем фильтры
             if not self._check_filters(market, spread, filters):
@@ -895,7 +942,7 @@ class AutoScanService:
                 return
             
             # Отправляем уведомление
-            await self._send_notification(user_id, market, spread)
+            await self._send_notification(user_id, market, spread, outcome)
             
             # Сохраняем в историю
             await self.db.save_notification(user_id, market_slug, spread)
@@ -960,7 +1007,7 @@ class AutoScanService:
             logger.error(f"Error checking notification deduplication: {e}")
             return True  # В случае ошибки разрешаем отправку
     
-    async def _send_notification(self, user_id: int, market: Dict, spread: float):
+    async def _send_notification(self, user_id: int, market: Dict, spread: float, outcome: str):
         """Отправить уведомление пользователю"""
         try:
             question = market.get("question", "Unknown Market")
@@ -980,22 +1027,59 @@ class AutoScanService:
             
             current_time = datetime.now().strftime("%H:%M:%S")
             
+            # Формируем ссылку на маркет
+            events = market.get("events", [])
+            if isinstance(events, str):
+                import json
+                events = json.loads(events)
+            
+            if events and len(events) > 0 and slug:
+                event_slug = events[0].get("slug", "")
+                market_url = f"https://polymarket.com/event/{event_slug}/{slug}"
+            elif slug:
+                market_url = f"https://polymarket.com/event/{slug}"
+            else:
+                market_url = ""
+            
             message = (
                 f"🔔 Найден рынок!\n\n"
                 f"🏛️ {question}\n\n"
-                f"📊 Спред: {spread}%\n"
+                f"📊 Спред: {spread}% ({outcome})\n"
                 f"💰 Yes: {yes_price:.3f} | No: {no_price:.3f}\n"
                 f"📈 Объём: ${volume:,.0f}\n"
                 f"💧 Ликвидность: ${liquidity:,.0f}\n"
-                f"🔗 Slug: {slug}\n\n"
-                f"⏰ {current_time}"
             )
+            
+            if market_url:
+                message += f"🔗 Ссылка: {market_url}\n"
+            
+            message += f"\n⏰ {current_time}"
             
             await self.bot.send_message(user_id, message)
             logger.info(f"Sent notification to user {user_id} for market {slug}")
         
         except Exception as e:
             logger.error(f"Error sending auto scan notification: {e}")
+
+# ============================================================================
+# KEYBOARD HELPERS
+# ============================================================================
+
+def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Создать главное меню с кнопками"""
+    keyboard = [
+        [
+            KeyboardButton(text="🔍 Поиск"),
+            KeyboardButton(text="📊 Мои рынки"),
+            KeyboardButton(text="🎯 Фильтры")
+        ],
+        [
+            KeyboardButton(text="🤖 Автоскан"),
+            KeyboardButton(text="📈 Статус"),
+            KeyboardButton(text="❓ Помощь")
+        ]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 # ============================================================================
 # BOT HANDLERS
@@ -1048,7 +1132,59 @@ async def cmd_start(message: Message, db: Database):
         "/my_categories - мои категории"
     )
     
-    await message.answer(text)
+    await message.answer(text, reply_markup=get_main_menu_keyboard())
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Обработчик команды /help"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    text = (
+        "📚 Справка по командам Polymarket Spread Monitor\n\n"
+        
+        "🔍 ПОИСК И УПРАВЛЕНИЕ РЫНКАМИ\n"
+        "/search <запрос> - найти рынки по ключевым словам\n"
+        "/set_market <slug> - добавить рынок в мониторинг\n"
+        "/markets - показать список отслеживаемых рынков\n"
+        "/remove_market <slug> - удалить рынок из мониторинга\n\n"
+        
+        "🎯 ФИЛЬТРЫ\n"
+        "/set_filter <type> <value> - установить фильтр\n"
+        "  Типы: min_spread, max_spread, min_volume, max_volume, min_liquidity\n"
+        "  Пример: /set_filter min_spread 5\n"
+        "/filters - показать активные фильтры\n"
+        "/remove_filter <id> - удалить фильтр по ID\n\n"
+        
+        "📊 МОНИТОРИНГ КОНКРЕТНЫХ РЫНКОВ\n"
+        "/status - показать статус мониторинга\n"
+        "/stop - остановить мониторинг\n\n"
+        
+        "🤖 АВТОСКАНИРОВАНИЕ\n"
+        "/auto_scan_start - запустить автосканирование\n"
+        "/auto_scan_stop - остановить автосканирование\n"
+        "/auto_scan_status - показать статус автосканирования\n"
+        "/auto_scan_mode <all|categories> - установить режим сканирования\n"
+        "/auto_scan_interval <секунды> - установить интервал сканирования\n"
+        "/auto_scan_dedup <часы> - установить время дедупликации\n\n"
+        
+        "📁 КАТЕГОРИИ (для режима categories)\n"
+        "/categories - показать доступные категории\n"
+        "/add_category <название> - добавить категорию для сканирования\n"
+        "/remove_category <название> - удалить категорию\n"
+        "/my_categories - показать мои категории\n\n"
+        
+        "💡 ПОДСКАЗКИ\n"
+        "• Максимум рынков в мониторинге: 5\n"
+        "• Интервал проверки: 10 секунд\n"
+        "• Используйте фильтры для точной настройки уведомлений\n"
+        "• Автосканирование работает независимо от мониторинга конкретных рынков"
+    )
+    
+    await message.answer(text, reply_markup=get_main_menu_keyboard())
 
 @router.message(Command("set_market"))
 async def cmd_set_market(message: Message, db: Database, api: PolymarketAPI, monitoring: MonitoringService):
@@ -1122,10 +1258,22 @@ async def cmd_markets(message: Message, db: Database):
         return
     
     text = f"📋 Ваши рынки ({len(markets)}/{MAX_MARKETS}):\n\n"
-    for i, market in enumerate(markets, 1):
-        text += f"{i}. {market['market_name']}\n   ({market['market_slug']})\n\n"
+    buttons = []
     
-    await message.answer(text)
+    for i, market in enumerate(markets, 1):
+        market_name = market['market_name']
+        market_slug = market['market_slug']
+        
+        text += f"{i}. {market_name}\n   🔗 {market_slug}\n\n"
+        
+        # Добавляем кнопку удаления для каждого рынка
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑️ Удалить рынок {i}",
+            callback_data=f"remove_market:{market_slug}"
+        )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(text, reply_markup=keyboard)
 
 @router.message(Command("remove_market"))
 async def cmd_remove_market(message: Message, db: Database, monitoring: MonitoringService):
@@ -1217,19 +1365,35 @@ async def cmd_filters(message: Message, db: Database):
         return
     
     text = "🔍 Активные фильтры:\n\n"
+    buttons = []
+    
     for filter_item in filters:
+        filter_id = filter_item["id"]
         filter_type = filter_item["filter_type"]
         filter_value = filter_item["filter_value"]
         
         if filter_type == "spread_min":
-            text += f"• Минимальный спред: {filter_value}%\n"
+            text += f"ID {filter_id}: Минимальный спред: {filter_value}%\n"
         elif filter_type == "volume_min":
-            text += f"• Минимальный объём: ${filter_value}\n"
+            text += f"ID {filter_id}: Минимальный объём: ${filter_value}\n"
         elif filter_type == "yes_price_between":
             min_val, max_val = filter_value.split(",")
-            text += f"• Цена Yes: между {min_val} и {max_val}\n"
+            text += f"ID {filter_id}: Цена Yes: между {min_val} и {max_val}\n"
+        
+        # Добавляем кнопку для удаления каждого фильтра
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑️ Удалить фильтр {filter_id}",
+            callback_data=f"remove_filter:{filter_id}"
+        )])
     
-    await message.answer(text)
+    # Добавляем кнопку для очистки всех фильтров
+    buttons.append([InlineKeyboardButton(
+        text="🧹 Очистить все фильтры",
+        callback_data="clear_all_filters"
+    )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(text, reply_markup=keyboard)
 
 @router.message(Command("status"))
 async def cmd_status(message: Message, db: Database):
@@ -1254,7 +1418,26 @@ async def cmd_status(message: Message, db: Database):
         f"• Интервал обновления: {MONITORING_INTERVAL} сек"
     )
     
-    await message.answer(text)
+    # Добавляем кнопки управления мониторингом
+    buttons = []
+    
+    if markets_count > 0:
+        if is_active:
+            buttons.append([InlineKeyboardButton(
+                text="⏸️ Остановить мониторинг",
+                callback_data="monitoring_stop"
+            )])
+        else:
+            buttons.append([InlineKeyboardButton(
+                text="▶️ Запустить мониторинг",
+                callback_data="monitoring_start"
+            )])
+    
+    if buttons:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await message.answer(text, reply_markup=keyboard)
+    else:
+        await message.answer(text)
 
 @router.message(Command("stop"))
 async def cmd_stop(message: Message, db: Database, monitoring: MonitoringService):
@@ -1304,24 +1487,28 @@ async def cmd_search(message: Message, api: PolymarketAPI):
             )
             return
         
-        text = f"🔍 Найдено рынков: {len(results)}\n\n"
-        for i, market in enumerate(results, 1):
+        # Отправляем результаты с inline кнопками
+        for i, market in enumerate(results[:5], 1):  # Показываем первые 5 результатов
             question = market.get("question", "Unknown")
             slug = market.get("slug", "unknown")
             volume = float(market.get("volume", 0))
             
-            text += f"{i}. {question}\n"
-            text += f"   Slug: {slug}\n"
-            text += f"   Объём: ${volume:,.0f}\n\n"
+            text = (
+                f"🔍 Результат {i}/{min(len(results), 5)}\n\n"
+                f"📊 {question}\n\n"
+                f"🔗 Slug: {slug}\n"
+                f"💰 Объём: ${volume:,.0f}"
+            )
             
-            if i >= 5:  # Ограничим вывод 5 рынками для читаемости
-                if len(results) > 5:
-                    text += f"... и ещё {len(results) - 5} рынков\n\n"
-                break
+            # Создаём inline кнопку для добавления рынка
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить рынок", callback_data=f"add_market:{slug}")]
+            ])
+            
+            await message.answer(text, reply_markup=keyboard)
         
-        text += "Для добавления рынка используйте:\n/set_market <slug>"
-        
-        await message.answer(text)
+        if len(results) > 5:
+            await message.answer(f"ℹ️ Показано 5 из {len(results)} найденных рынков")
     
     except Exception as e:
         logger.error(f"Error in search command: {e}")
@@ -1617,10 +1804,433 @@ async def cmd_my_categories(message: Message, db: Database):
         return
     
     text = f"📋 Ваши категории ({len(categories)}):\n\n"
+    buttons = []
+    
     for i, cat in enumerate(categories, 1):
         text += f"{i}. {cat}\n"
+        
+        # Добавляем кнопку удаления для каждой категории
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑️ Удалить {cat}",
+            callback_data=f"remove_category:{cat}"
+        )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(text, reply_markup=keyboard)
+
+# ============================================================================
+# TEXT HANDLERS (для Reply Keyboard кнопок)
+# ============================================================================
+
+@router.message(F.text == "🔍 Поиск")
+async def btn_search(message: Message):
+    """Обработчик кнопки Поиск"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    await message.answer(
+        "🔍 Поиск рынков\n\n"
+        "Используйте команду:\n"
+        "/search <ключевые слова>\n\n"
+        "Пример:\n"
+        "/search trump election"
+    )
+
+@router.message(F.text == "📊 Мои рынки")
+async def btn_markets(message: Message, db: Database):
+    """Обработчик кнопки Мои рынки"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    markets = await db.get_markets(user_id)
+    
+    if not markets:
+        await message.answer("📊 У вас нет отслеживаемых рынков\n\nИспользуйте /search для поиска рынков")
+        return
+    
+    text = f"📊 Ваши рынки ({len(markets)}/{MAX_MARKETS}):\n\n"
+    for i, (slug, name) in enumerate(markets, 1):
+        text += f"{i}. {name}\n🔗 {slug}\n\n"
     
     await message.answer(text)
+
+@router.message(F.text == "🎯 Фильтры")
+async def btn_filters(message: Message, db: Database):
+    """Обработчик кнопки Фильтры"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    filters = await db.get_filters(user_id)
+    
+    if not filters:
+        await message.answer(
+            "🎯 У вас нет активных фильтров\n\n"
+            "Установите фильтр командой:\n"
+            "/set_filter <type> <value>\n\n"
+            "Доступные типы:\n"
+            "• min_spread - минимальный спред (%)\n"
+            "• max_spread - максимальный спред (%)\n"
+            "• min_volume - минимальный объём ($)\n"
+            "• max_volume - максимальный объём ($)\n"
+            "• min_liquidity - минимальная ликвидность ($)"
+        )
+        return
+    
+    text = "🎯 Активные фильтры:\n\n"
+    for filter_id, filter_type, filter_value in filters:
+        text += f"ID {filter_id}: {filter_type} = {filter_value}\n"
+    
+    text += "\n💡 Удалить фильтр: /remove_filter <id>"
+    
+    await message.answer(text)
+
+@router.message(F.text == "🤖 Автоскан")
+async def btn_autoscan(message: Message, db: Database):
+    """Обработчик кнопки Автоскан"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    settings = await db.get_auto_scan_settings(user_id)
+    
+    status = "активно ✅" if settings['is_enabled'] else "остановлено ⏸️"
+    
+    text = (
+        f"🤖 Автосканирование: {status}\n\n"
+        f"⚙️ Настройки:\n"
+        f"• Режим: {settings['scan_mode']}\n"
+        f"• Интервал: {settings['interval']} сек\n"
+        f"• Дедупликация: {settings['dedup_hours']} ч\n\n"
+        "📝 Команды:\n"
+        "/auto_scan_start - запустить\n"
+        "/auto_scan_stop - остановить\n"
+        "/auto_scan_status - подробный статус\n"
+        "/auto_scan_mode <all|categories> - режим"
+    )
+    
+    await message.answer(text)
+
+@router.message(F.text == "📈 Статус")
+async def btn_status(message: Message, db: Database):
+    """Обработчик кнопки Статус"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    markets = await db.get_markets(user_id)
+    is_active = await db.get_monitoring_state(user_id)
+    filters = await db.get_filters(user_id)
+    auto_scan_settings = await db.get_auto_scan_settings(user_id)
+    
+    status = "активен ✅" if is_active else "остановлен ⏸️"
+    auto_scan_status = "активно ✅" if auto_scan_settings['is_enabled'] else "остановлено ⏸️"
+    
+    text = (
+        "📈 Статус бота\n\n"
+        "📊 Мониторинг конкретных рынков:\n"
+        f"• Рынков: {len(markets)}/{MAX_MARKETS}\n"
+        f"• Статус: {status}\n"
+        f"• Фильтров: {len(filters)}\n"
+        f"• Интервал: {MONITORING_INTERVAL} сек\n\n"
+        "🤖 Автосканирование:\n"
+        f"• Статус: {auto_scan_status}\n"
+        f"• Режим: {auto_scan_settings['scan_mode']}\n"
+        f"• Интервал: {auto_scan_settings['interval']} сек\n"
+        f"• Дедупликация: {auto_scan_settings['dedup_hours']} ч"
+    )
+    
+    await message.answer(text)
+
+@router.message(F.text == "❓ Помощь")
+async def btn_help(message: Message):
+    """Обработчик кнопки Помощь"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    # Вызываем команду /help
+    await cmd_help(message)
+
+# ============================================================================
+# CALLBACK HANDLERS (для Inline кнопок)
+# ============================================================================
+
+@router.callback_query(F.data.startswith("add_market:"))
+async def callback_add_market(callback: CallbackQuery, db: Database, api: PolymarketAPI, monitoring: MonitoringService):
+    """Обработчик callback для добавления рынка"""
+    user_id = callback.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await callback.answer("❌ Access denied", show_alert=True)
+        return
+    
+    # Извлекаем slug из callback_data
+    slug = callback.data.split(":", 1)[1]
+    
+    try:
+        # Проверяем лимит рынков
+        markets_count = await db.get_markets_count(user_id)
+        if markets_count >= MAX_MARKETS:
+            await callback.answer(f"❌ Достигнут лимит рынков ({MAX_MARKETS})", show_alert=True)
+            return
+        
+        # Получаем данные о рынке
+        market_data = await api.get_market_by_slug(slug)
+        if not market_data:
+            await callback.answer("❌ Рынок не найден", show_alert=True)
+            return
+        
+        market_name = market_data.get("question", "Unknown")
+        
+        # Добавляем рынок
+        success = await db.add_market(user_id, slug, market_name)
+        
+        if not success:
+            await callback.answer("❌ Этот рынок уже добавлен", show_alert=True)
+            return
+        
+        # Запускаем мониторинг если не активен
+        is_active = await db.get_monitoring_state(user_id)
+        if not is_active:
+            await db.set_monitoring_state(user_id, True)
+            await monitoring.start_monitoring(user_id)
+        
+        await callback.answer("✅ Рынок добавлен и мониторинг запущен!", show_alert=True)
+        
+        # Обновляем сообщение
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n✅ Рынок добавлен в мониторинг!",
+            reply_markup=None
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in callback_add_market: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("remove_market:"))
+async def callback_remove_market(callback: CallbackQuery, db: Database, monitoring: MonitoringService):
+    """Обработчик callback для удаления рынка"""
+    user_id = callback.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await callback.answer("❌ Access denied", show_alert=True)
+        return
+    
+    slug = callback.data.split(":", 1)[1]
+    
+    try:
+        success = await db.remove_market(user_id, slug)
+        
+        if success:
+            await callback.answer("✅ Рынок удалён", show_alert=True)
+            
+            # Проверяем, остались ли рынки
+            markets_count = await db.get_markets_count(user_id)
+            if markets_count == 0:
+                await monitoring.stop_monitoring(user_id)
+            
+            # Обновляем сообщение
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n🗑️ Рынок удалён из мониторинга",
+                reply_markup=None
+            )
+        else:
+            await callback.answer("❌ Рынок не найден", show_alert=True)
+    
+    except Exception as e:
+        logger.error(f"Error in callback_remove_market: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("remove_filter:"))
+async def callback_remove_filter(callback: CallbackQuery, db: Database):
+    """Обработчик callback для удаления фильтра"""
+    user_id = callback.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await callback.answer("❌ Access denied", show_alert=True)
+        return
+    
+    filter_id = int(callback.data.split(":", 1)[1])
+    
+    try:
+        success = await db.remove_filter(user_id, filter_id)
+        
+        if success:
+            await callback.answer("✅ Фильтр удалён", show_alert=True)
+            
+            # Обновляем список фильтров
+            filters = await db.get_filters(user_id)
+            
+            if not filters:
+                await callback.message.edit_text(
+                    "🎯 Все фильтры удалены\n\nУстановите новый фильтр командой:\n/set_filter <type> <value>",
+                    reply_markup=None
+                )
+            else:
+                text = "🎯 Активные фильтры:\n\n"
+                buttons = []
+                
+                for fid, ftype, fvalue in filters:
+                    text += f"ID {fid}: {ftype} = {fvalue}\n"
+                    buttons.append([InlineKeyboardButton(
+                        text=f"🗑️ Удалить фильтр {fid}",
+                        callback_data=f"remove_filter:{fid}"
+                    )])
+                
+                buttons.append([InlineKeyboardButton(
+                    text="🧹 Очистить все фильтры",
+                    callback_data="clear_all_filters"
+                )])
+                
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+                await callback.message.edit_text(text, reply_markup=keyboard)
+        else:
+            await callback.answer("❌ Фильтр не найден", show_alert=True)
+    
+    except Exception as e:
+        logger.error(f"Error in callback_remove_filter: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data == "clear_all_filters")
+async def callback_clear_all_filters(callback: CallbackQuery, db: Database):
+    """Обработчик callback для очистки всех фильтров"""
+    user_id = callback.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await callback.answer("❌ Access denied", show_alert=True)
+        return
+    
+    try:
+        filters = await db.get_filters(user_id)
+        
+        for filter_id, _, _ in filters:
+            await db.remove_filter(user_id, filter_id)
+        
+        await callback.answer("✅ Все фильтры удалены", show_alert=True)
+        await callback.message.edit_text(
+            "🎯 Все фильтры удалены\n\nУстановите новый фильтр командой:\n/set_filter <type> <value>",
+            reply_markup=None
+        )
+    
+    except Exception as e:
+        logger.error(f"Error in callback_clear_all_filters: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data == "monitoring_start")
+async def callback_monitoring_start(callback: CallbackQuery, db: Database, monitoring: MonitoringService):
+    """Обработчик callback для запуска мониторинга"""
+    user_id = callback.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await callback.answer("❌ Access denied", show_alert=True)
+        return
+    
+    try:
+        markets_count = await db.get_markets_count(user_id)
+        
+        if markets_count == 0:
+            await callback.answer("❌ Нет рынков для мониторинга", show_alert=True)
+            return
+        
+        await db.set_monitoring_state(user_id, True)
+        await monitoring.start_monitoring(user_id)
+        
+        await callback.answer("✅ Мониторинг запущен", show_alert=True)
+        
+        # Обновляем сообщение
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n▶️ Мониторинг запущен",
+            reply_markup=None
+        )
+    
+    except Exception as e:
+        logger.error(f"Error in callback_monitoring_start: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data == "monitoring_stop")
+async def callback_monitoring_stop(callback: CallbackQuery, db: Database, monitoring: MonitoringService):
+    """Обработчик callback для остановки мониторинга"""
+    user_id = callback.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await callback.answer("❌ Access denied", show_alert=True)
+        return
+    
+    try:
+        await monitoring.stop_monitoring(user_id)
+        await db.set_monitoring_state(user_id, False)
+        
+        await callback.answer("✅ Мониторинг остановлен", show_alert=True)
+        
+        # Обновляем сообщение
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n⏸️ Мониторинг остановлен",
+            reply_markup=None
+        )
+    
+    except Exception as e:
+        logger.error(f"Error in callback_monitoring_stop: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
+
+@router.callback_query(F.data.startswith("remove_category:"))
+async def callback_remove_category(callback: CallbackQuery, db: Database):
+    """Обработчик callback для удаления категории"""
+    user_id = callback.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await callback.answer("❌ Access denied", show_alert=True)
+        return
+    
+    category = callback.data.split(":", 1)[1]
+    
+    try:
+        success = await db.remove_scan_category(user_id, category)
+        
+        if success:
+            await callback.answer("✅ Категория удалена", show_alert=True)
+            
+            # Обновляем список категорий
+            categories = await db.get_scan_categories(user_id)
+            
+            if not categories:
+                await callback.message.edit_text(
+                    "📋 Все категории удалены\n\nДобавьте категорию:\n/add_category <название>",
+                    reply_markup=None
+                )
+            else:
+                text = f"📋 Ваши категории ({len(categories)}):\n\n"
+                buttons = []
+                
+                for i, cat in enumerate(categories, 1):
+                    text += f"{i}. {cat}\n"
+                    buttons.append([InlineKeyboardButton(
+                        text=f"🗑️ Удалить {cat}",
+                        callback_data=f"remove_category:{cat}"
+                    )])
+                
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+                await callback.message.edit_text(text, reply_markup=keyboard)
+        else:
+            await callback.answer("❌ Категория не найдена", show_alert=True)
+    
+    except Exception as e:
+        logger.error(f"Error in callback_remove_category: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
 # ============================================================================
 # MAIN
