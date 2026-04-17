@@ -23,8 +23,6 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery
@@ -1222,22 +1220,6 @@ class AutoScanService:
 # KEYBOARD HELPERS
 # ============================================================================
 
-def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Создать главное меню с кнопками"""
-    keyboard = [
-        [
-            KeyboardButton(text="🔍 Поиск"),
-            KeyboardButton(text="📊 Мои рынки"),
-            KeyboardButton(text="🎯 Фильтры")
-        ],
-        [
-            KeyboardButton(text="🤖 Автоскан"),
-            KeyboardButton(text="📈 Статус"),
-            KeyboardButton(text="❓ Помощь")
-        ]
-    ]
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-
 # ============================================================================
 # BOT HANDLERS
 # ============================================================================
@@ -1289,7 +1271,7 @@ async def cmd_start(message: Message, db: Database):
         "/my_categories - мои категории"
     )
     
-    await message.answer(text, reply_markup=get_main_menu_keyboard())
+    await message.answer(text)
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -1342,7 +1324,7 @@ async def cmd_help(message: Message):
         "• Автосканирование работает независимо от мониторинга конкретных рынков"
     )
     
-    await message.answer(text, reply_markup=get_main_menu_keyboard())
+    await message.answer(text)
 
 @router.message(Command("set_market"))
 async def cmd_set_market(message: Message, db: Database, api: PolymarketAPI, monitoring: MonitoringService):
@@ -2020,150 +2002,6 @@ async def cmd_my_categories(message: Message, db: Database):
 # ============================================================================
 # TEXT HANDLERS (для Reply Keyboard кнопок)
 # ============================================================================
-
-@router.message(F.text == "🔍 Поиск")
-async def btn_search(message: Message):
-    """Обработчик кнопки Поиск"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    await message.answer(
-        "🔍 Поиск рынков\n\n"
-        "Используйте команду:\n"
-        "/search <ключевые слова>\n\n"
-        "Пример:\n"
-        "/search trump election"
-    )
-
-@router.message(F.text == "📊 Мои рынки")
-async def btn_markets(message: Message, db: Database):
-    """Обработчик кнопки Мои рынки"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    markets = await db.get_markets(user_id)
-    
-    if not markets:
-        await message.answer("📊 У вас нет отслеживаемых рынков\n\nИспользуйте /search для поиска рынков")
-        return
-    
-    text = f"📊 Ваши рынки ({len(markets)}/{MAX_MARKETS}):\n\n"
-    for i, (slug, name) in enumerate(markets, 1):
-        text += f"{i}. {name}\n🔗 {slug}\n\n"
-    
-    await message.answer(text)
-
-@router.message(F.text == "🎯 Фильтры")
-async def btn_filters(message: Message, db: Database):
-    """Обработчик кнопки Фильтры"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    filters = await db.get_filters(user_id)
-    
-    if not filters:
-        await message.answer(
-            "🎯 У вас нет активных фильтров\n\n"
-            "Установите фильтр командой:\n"
-            "/set_filter <type> <value>\n\n"
-            "Доступные типы:\n"
-            "• min_spread - минимальный спред (%)\n"
-            "• max_spread - максимальный спред (%)\n"
-            "• min_volume - минимальный объём ($)\n"
-            "• max_volume - максимальный объём ($)\n"
-            "• min_liquidity - минимальная ликвидность ($)"
-        )
-        return
-    
-    text = "🎯 Активные фильтры:\n\n"
-    for filter_id, filter_type, filter_value in filters:
-        text += f"ID {filter_id}: {filter_type} = {filter_value}\n"
-    
-    text += "\n💡 Удалить фильтр: /remove_filter <id>"
-    
-    await message.answer(text)
-
-@router.message(F.text == "🤖 Автоскан")
-async def btn_autoscan(message: Message, db: Database):
-    """Обработчик кнопки Автоскан"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    settings = await db.get_auto_scan_settings(user_id)
-    
-    status = "активно ✅" if settings['is_enabled'] else "остановлено ⏸️"
-    
-    text = (
-        f"🤖 Автосканирование: {status}\n\n"
-        f"⚙️ Настройки:\n"
-        f"• Режим: {settings['scan_mode']}\n"
-        f"• Интервал: {settings['interval']} сек\n"
-        f"• Дедупликация: {settings['dedup_hours']} ч\n\n"
-        "📝 Команды:\n"
-        "/auto_scan_start - запустить\n"
-        "/auto_scan_stop - остановить\n"
-        "/auto_scan_status - подробный статус\n"
-        "/auto_scan_mode <all|categories> - режим"
-    )
-    
-    await message.answer(text)
-
-@router.message(F.text == "📈 Статус")
-async def btn_status(message: Message, db: Database):
-    """Обработчик кнопки Статус"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    markets = await db.get_markets(user_id)
-    is_active = await db.get_monitoring_state(user_id)
-    filters = await db.get_filters(user_id)
-    auto_scan_settings = await db.get_auto_scan_settings(user_id)
-    
-    status = "активен ✅" if is_active else "остановлен ⏸️"
-    auto_scan_status = "активно ✅" if auto_scan_settings['is_enabled'] else "остановлено ⏸️"
-    
-    text = (
-        "📈 Статус бота\n\n"
-        "📊 Мониторинг конкретных рынков:\n"
-        f"• Рынков: {len(markets)}/{MAX_MARKETS}\n"
-        f"• Статус: {status}\n"
-        f"• Фильтров: {len(filters)}\n"
-        f"• Интервал: {MONITORING_INTERVAL} сек\n\n"
-        "🤖 Автосканирование:\n"
-        f"• Статус: {auto_scan_status}\n"
-        f"• Режим: {auto_scan_settings['scan_mode']}\n"
-        f"• Интервал: {auto_scan_settings['interval']} сек\n"
-        f"• Дедупликация: {auto_scan_settings['dedup_hours']} ч"
-    )
-    
-    await message.answer(text)
-
-@router.message(F.text == "❓ Помощь")
-async def btn_help(message: Message):
-    """Обработчик кнопки Помощь"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    # Вызываем команду /help
-    await cmd_help(message)
 
 # ============================================================================
 # CALLBACK HANDLERS (для Inline кнопок)
