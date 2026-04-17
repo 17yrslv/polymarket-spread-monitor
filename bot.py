@@ -14,6 +14,10 @@ from typing import List, Dict, Optional, Tuple
 from loguru import logger
 import aiohttp
 from aiohttp_socks import ProxyConnector
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
