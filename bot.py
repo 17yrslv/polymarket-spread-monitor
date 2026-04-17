@@ -975,60 +975,30 @@ class AutoScanService:
                 
                 logger.info(f"Starting scan for user {user_id} (max_pages={max_pages})")
                 
-                # Загрузить рынки в зависимости от режима
-                if scan_mode == 'categories':
-                    categories = await self.db.get_scan_categories(user_id)
-                    if not categories:
-                        logger.warning(f"User {user_id} has no categories selected, skipping scan")
-                        await asyncio.sleep(scan_interval)
-                        continue
+                # Используем потоковую загрузку с пагинацией (всегда режим 'all')
+                page_num = 0
+                async for markets_page in self.api.get_all_active_markets_stream(min_volume=0, max_pages=max_pages):
+                    page_num += 1
+                    logger.info(f"Processing page {page_num} with {len(markets_page)} markets...")
                     
-                    # Для режима категорий используем старый метод (без пагинации)
-                    markets = await self.api.get_markets_by_categories(categories)
-                    
-                    if not markets:
-                        logger.warning(f"No markets to scan for user {user_id}")
-                        await asyncio.sleep(scan_interval)
-                        continue
-                    
-                    logger.info(f"Scanning {len(markets)} markets for user {user_id}")
-                    
-                    # Обрабатываем рынки батчами
-                    for i in range(0, len(markets), AUTO_SCAN_BATCH_SIZE):
-                        batch = markets[i:i + AUTO_SCAN_BATCH_SIZE]
+                    # Обрабатываем страницу батчами по 50
+                    for i in range(0, len(markets_page), AUTO_SCAN_BATCH_SIZE):
+                        batch = markets_page[i:i + AUTO_SCAN_BATCH_SIZE]
                         stats = await self._process_batch(user_id, batch, filters, dedup_hours)
+                        
+                        # Обновляем счетчики
                         passed_filters += stats.get('passed_filters', 0)
                         blocked_by_dedup += stats.get('blocked_by_dedup', 0)
                         sent_notifications += stats.get('sent_notifications', 0)
                         total_scanned += len(batch)
                         
-                        if i + AUTO_SCAN_BATCH_SIZE < len(markets):
-                            await asyncio.sleep(1)
-                
-                else:  # scan_mode == 'all' - используем потоковую загрузку с пагинацией
-                    page_num = 0
-                    async for markets_page in self.api.get_all_active_markets_stream(min_volume=0, max_pages=max_pages):
-                        page_num += 1
-                        logger.info(f"Processing page {page_num} with {len(markets_page)} markets...")
-                        
-                        # Обрабатываем страницу батчами по 50
-                        for i in range(0, len(markets_page), AUTO_SCAN_BATCH_SIZE):
-                            batch = markets_page[i:i + AUTO_SCAN_BATCH_SIZE]
-                            stats = await self._process_batch(user_id, batch, filters, dedup_hours)
-                            
-                            # Обновляем счетчики
-                            passed_filters += stats.get('passed_filters', 0)
-                            blocked_by_dedup += stats.get('blocked_by_dedup', 0)
-                            sent_notifications += stats.get('sent_notifications', 0)
-                            total_scanned += len(batch)
-                            
-                            # Задержка между батчами
-                            await asyncio.sleep(0.5)
-                        
-                        logger.info(f"Page {page_num} processed: {total_scanned} total scanned, {sent_notifications} sent so far")
-                        
-                        # Задержка между страницами
-                        await asyncio.sleep(AUTO_SCAN_PAGE_DELAY)
+                        # Задержка между батчами
+                        await asyncio.sleep(0.5)
+                    
+                    logger.info(f"Page {page_num} processed: {total_scanned} total scanned, {sent_notifications} sent so far")
+                    
+                    # Задержка между страницами
+                    await asyncio.sleep(AUTO_SCAN_PAGE_DELAY)
                 
                 # Очистка старых уведомлений
                 await self.db.cleanup_old_notifications(days=7)
@@ -1264,11 +1234,7 @@ async def cmd_start(message: Message, db: Database):
         "🤖 Автосканирование:\n"
         "/auto_scan_start - запустить\n"
         "/auto_scan_stop - остановить\n"
-        "/auto_scan_status - статус\n"
-        "/auto_scan_mode <all|categories> - режим\n"
-        "/categories - список категорий\n"
-        "/add_category <название> - добавить категорию\n"
-        "/my_categories - мои категории"
+        "/auto_scan_status - статус"
     )
     
     await message.answer(text)
@@ -1306,16 +1272,9 @@ async def cmd_help(message: Message):
         "/auto_scan_start - запустить автосканирование\n"
          "/auto_scan_stop - остановить автосканирование\n"
          "/auto_scan_status - показать статус автосканирования\n"
-         "/auto_scan_mode <all|categories> - установить режим сканирования\n"
          "/auto_scan_interval <секунды> - установить интервал сканирования\n"
          "/auto_scan_dedup <часы> - установить время дедупликации\n"
          "/auto_scan_pages <количество> - установить количество страниц для сканирования (1-100, каждая = 1000 рынков)\n\n"
-        
-        "📁 КАТЕГОРИИ (для режима categories)\n"
-        "/categories - показать доступные категории\n"
-        "/add_category <название> - добавить категорию для сканирования\n"
-        "/remove_category <название> - удалить категорию\n"
-        "/my_categories - показать мои категории\n\n"
         
         "💡 ПОДСКАЗКИ\n"
         "• Максимум рынков в мониторинге: 5\n"
@@ -1687,10 +1646,9 @@ async def cmd_auto_scan_start(message: Message, db: Database, auto_scan: AutoSca
     
     await auto_scan.start_auto_scan(user_id)
     
-    mode_text = "все рынки" if settings['scan_mode'] == 'all' else f"категории: {', '.join(await db.get_scan_categories(user_id))}"
     await message.answer(
         f"🚀 Автосканирование запущено!\n\n"
-        f"Режим: {mode_text}\n"
+        f"Режим: все рынки\n"
         f"Интервал: {settings['scan_interval']} сек\n"
         f"Дедупликация: {settings['dedup_hours']} ч"
     )
@@ -1726,58 +1684,18 @@ async def cmd_auto_scan_status(message: Message, db: Database):
     filters = await db.get_filters(user_id)
     
     status = "активно ✅" if settings['is_enabled'] else "остановлено ⏸️"
-    mode = "все рынки" if settings['scan_mode'] == 'all' else "по категориям"
     
     text = (
         "📊 Статус автосканирования:\n\n"
         f"• Состояние: {status}\n"
-        f"• Режим: {mode}\n"
+        f"• Режим: все рынки\n"
         f"• Интервал: {settings['scan_interval']} сек\n"
         f"• Дедупликация: {settings['dedup_hours']} ч\n"
         f"• Страниц для сканирования: {settings.get('max_pages', AUTO_SCAN_MAX_PAGES)} ({settings.get('max_pages', AUTO_SCAN_MAX_PAGES) * 1000} рынков)\n"
         f"• Фильтров: {len(filters)}\n"
     )
     
-    if settings['scan_mode'] == 'categories':
-        categories = await db.get_scan_categories(user_id)
-        text += f"• Категорий: {len(categories)}\n"
-        if categories:
-            text += f"\nКатегории:\n"
-            for cat in categories[:5]:
-                text += f"  - {cat}\n"
-            if len(categories) > 5:
-                text += f"  ... и ещё {len(categories) - 5}\n"
-    
     await message.answer(text)
-
-@router.message(Command("auto_scan_mode"))
-async def cmd_auto_scan_mode(message: Message, db: Database):
-    """Обработчик команды /auto_scan_mode"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer(
-            "❌ Использование: /auto_scan_mode <all|categories>\n\n"
-            "Примеры:\n"
-            "/auto_scan_mode all - сканировать все рынки\n"
-            "/auto_scan_mode categories - сканировать выбранные категории"
-        )
-        return
-    
-    mode = args[1].lower()
-    if mode not in ['all', 'categories']:
-        await message.answer("❌ Режим должен быть 'all' или 'categories'")
-        return
-    
-    await db.set_auto_scan_settings(user_id, scan_mode=mode)
-    
-    mode_text = "все рынки" if mode == 'all' else "по категориям"
-    await message.answer(f"✅ Режим сканирования установлен: {mode_text}")
 
 @router.message(Command("auto_scan_interval"))
 async def cmd_auto_scan_interval(message: Message, db: Database):
@@ -1880,124 +1798,6 @@ async def cmd_auto_scan_pages(message: Message, db: Database):
     
     except ValueError:
         await message.answer("❌ Неверное значение. Укажите число страниц")
-
-@router.message(Command("categories"))
-async def cmd_categories(message: Message, api: PolymarketAPI):
-    """Обработчик команды /categories"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    await message.answer("🔍 Загружаю список категорий...")
-    
-    try:
-        categories = await api.get_all_unique_categories()
-        
-        if not categories:
-            await message.answer("❌ Не удалось загрузить категории")
-            return
-        
-        text = f"📋 Доступные категории ({len(categories)}):\n\n"
-        
-        # Показываем первые 20 категорий
-        for i, cat in enumerate(categories[:20], 1):
-            text += f"{i}. {cat}\n"
-        
-        if len(categories) > 20:
-            text += f"\n... и ещё {len(categories) - 20} категорий\n"
-        
-        text += "\nДля добавления категории:\n/add_category <название>"
-        
-        await message.answer(text)
-    
-    except Exception as e:
-        logger.error(f"Error in categories command: {e}")
-        await message.answer(f"❌ Ошибка: {str(e)}")
-
-@router.message(Command("add_category"))
-async def cmd_add_category(message: Message, db: Database):
-    """Обработчик команды /add_category"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "❌ Использование: /add_category <название>\n\n"
-            "Примеры:\n"
-            "/add_category Politics\n"
-            "/add_category Bitcoin hits $1m\n\n"
-            "Посмотреть доступные категории:\n/categories"
-        )
-        return
-    
-    category = args[1].strip()
-    success = await db.add_scan_category(user_id, category)
-    
-    if success:
-        await message.answer(f"✅ Категория добавлена: {category}")
-    else:
-        await message.answer(f"❌ Категория уже добавлена или ошибка")
-
-@router.message(Command("remove_category"))
-async def cmd_remove_category(message: Message, db: Database):
-    """Обработчик команды /remove_category"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("❌ Использование: /remove_category <название>")
-        return
-    
-    category = args[1].strip()
-    success = await db.remove_scan_category(user_id, category)
-    
-    if success:
-        await message.answer(f"✅ Категория удалена: {category}")
-    else:
-        await message.answer(f"❌ Категория не найдена")
-
-@router.message(Command("my_categories"))
-async def cmd_my_categories(message: Message, db: Database):
-    """Обработчик команды /my_categories"""
-    user_id = message.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await message.answer("❌ Access denied")
-        return
-    
-    categories = await db.get_scan_categories(user_id)
-    
-    if not categories:
-        await message.answer(
-            "📋 У вас нет выбранных категорий\n\n"
-            "Добавьте категорию:\n/add_category <название>"
-        )
-        return
-    
-    text = f"📋 Ваши категории ({len(categories)}):\n\n"
-    buttons = []
-    
-    for i, cat in enumerate(categories, 1):
-        text += f"{i}. {cat}\n"
-        
-        # Добавляем кнопку удаления для каждой категории
-        buttons.append([InlineKeyboardButton(
-            text=f"🗑️ Удалить {cat}",
-            callback_data=f"remove_category:{cat}"
-        )])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(text, reply_markup=keyboard)
 
 # ============================================================================
 # TEXT HANDLERS (для Reply Keyboard кнопок)
@@ -2224,54 +2024,10 @@ async def callback_monitoring_stop(callback: CallbackQuery, db: Database, monito
         logger.error(f"Error in callback_monitoring_stop: {e}")
         await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
-@router.callback_query(F.data.startswith("remove_category:"))
-async def callback_remove_category(callback: CallbackQuery, db: Database):
-    """Обработчик callback для удаления категории"""
-    user_id = callback.from_user.id
-    
-    if user_id != ALLOWED_USER_ID:
-        await callback.answer("❌ Access denied", show_alert=True)
-        return
-    
-    category = callback.data.split(":", 1)[1]
-    
-    try:
-        success = await db.remove_scan_category(user_id, category)
-        
-        if success:
-            await callback.answer("✅ Категория удалена", show_alert=True)
-            
-            # Обновляем список категорий
-            categories = await db.get_scan_categories(user_id)
-            
-            if not categories:
-                await callback.message.edit_text(
-                    "📋 Все категории удалены\n\nДобавьте категорию:\n/add_category <название>",
-                    reply_markup=None
-                )
-            else:
-                text = f"📋 Ваши категории ({len(categories)}):\n\n"
-                buttons = []
-                
-                for i, cat in enumerate(categories, 1):
-                    text += f"{i}. {cat}\n"
-                    buttons.append([InlineKeyboardButton(
-                        text=f"🗑️ Удалить {cat}",
-                        callback_data=f"remove_category:{cat}"
-                    )])
-                
-                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-                await callback.message.edit_text(text, reply_markup=keyboard)
-        else:
-            await callback.answer("❌ Категория не найдена", show_alert=True)
-    
-    except Exception as e:
-        logger.error(f"Error in callback_remove_category: {e}")
-        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
-
 # ============================================================================
 # MAIN
 # ============================================================================
+
 
 async def main():
     """Главная функция"""
