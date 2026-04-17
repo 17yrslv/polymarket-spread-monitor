@@ -9,7 +9,7 @@ import os
 import sys
 import asyncio
 import aiosqlite
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 from loguru import logger
 import aiohttp
@@ -486,7 +486,7 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO monitoring_state (user_id, is_active, last_update) VALUES (?, ?, ?)",
-                (user_id, 1 if is_active else 0, datetime.now().isoformat())
+                (user_id, 1 if is_active else 0, datetime.now(timezone.utc).isoformat())
             )
             await db.commit()
     
@@ -649,7 +649,7 @@ class Database:
                 )
                 row = await cursor.fetchone()
                 if row:
-                    return datetime.fromisoformat(row[0])
+                    return datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
                 return None
             except Exception as e:
                 logger.error(f"Error getting last notification: {e}")
@@ -659,7 +659,7 @@ class Database:
         """Очистить старые уведомления"""
         async with aiosqlite.connect(self.db_path) as db:
             try:
-                cutoff_date = datetime.now() - timedelta(days=days)
+                cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
                 await db.execute(
                     "DELETE FROM notification_history WHERE sent_at < ?",
                     (cutoff_date.isoformat(),)
@@ -793,7 +793,7 @@ class MonitoringService:
             yes_price = float(outcome_prices[0]) if outcome_prices and len(outcome_prices) > 0 else 0
             no_price = float(outcome_prices[1]) if outcome_prices and len(outcome_prices) > 1 else 0
             
-            current_time = datetime.now().strftime("%H:%M:%S")
+            current_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
             
             # Формируем ссылку на маркет
             events = data.get("events", [])
@@ -895,10 +895,18 @@ class AutoScanService:
                 
                 logger.info(f"Scanning {len(markets)} markets for user {user_id}")
                 
+                # Счетчики для статистики
+                passed_filters = 0
+                blocked_by_dedup = 0
+                sent_notifications = 0
+                
                 # Обрабатываем рынки батчами для оптимизации
                 for i in range(0, len(markets), AUTO_SCAN_BATCH_SIZE):
                     batch = markets[i:i + AUTO_SCAN_BATCH_SIZE]
-                    await self._process_batch(user_id, batch, filters, dedup_hours)
+                    stats = await self._process_batch(user_id, batch, filters, dedup_hours)
+                    passed_filters += stats.get('passed_filters', 0)
+                    blocked_by_dedup += stats.get('blocked_by_dedup', 0)
+                    sent_notifications += stats.get('sent_notifications', 0)
                     
                     # Небольшая задержка между батчами чтобы не перегружать API
                     if i + AUTO_SCAN_BATCH_SIZE < len(markets):
@@ -907,7 +915,7 @@ class AutoScanService:
                 # Очистка старых уведомлений
                 await self.db.cleanup_old_notifications(days=7)
                 
-                logger.info(f"Scan completed for user {user_id}, sleeping for {scan_interval}s")
+                logger.info(f"Scan completed for user {user_id}: {len(markets)} markets scanned, {passed_filters} passed filters, {blocked_by_dedup} blocked by dedup, {sent_notifications} notifications sent, sleeping for {scan_interval}s")
                 await asyncio.sleep(scan_interval)
             
             except asyncio.CancelledError:
@@ -925,34 +933,55 @@ class AutoScanService:
             tasks.append(task)
         
         # Обрабатываем все рынки в батче параллельно
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Подсчитываем статистику
+        stats = {
+            'passed_filters': 0,
+            'blocked_by_dedup': 0,
+            'sent_notifications': 0
+        }
+        
+        for result in results:
+            if isinstance(result, dict):
+                stats['passed_filters'] += result.get('passed_filters', 0)
+                stats['blocked_by_dedup'] += result.get('blocked_by_dedup', 0)
+                stats['sent_notifications'] += result.get('sent_notifications', 0)
+        
+        return stats
     
     async def _process_market(self, user_id: int, market: Dict, filters: List[Dict], dedup_hours: int):
         """Обработать один рынок"""
         try:
             market_slug = market.get('slug')
             if not market_slug:
-                return
+                return {}
             
             # Рассчитываем спред
             spread, outcome = self.api.calculate_spread(market)
             
             # Проверяем фильтры
             if not self._check_filters(market, spread, filters):
-                return
+                return {}
+            
+            # Рынок прошел фильтры
+            passed_filters = 1
             
             # Проверяем дедупликацию
             if not await self._should_notify(user_id, market_slug, dedup_hours):
-                return
+                return {'passed_filters': passed_filters, 'blocked_by_dedup': 1, 'sent_notifications': 0}
             
             # Отправляем уведомление
             await self._send_notification(user_id, market, spread, outcome)
             
             # Сохраняем в историю
             await self.db.save_notification(user_id, market_slug, spread)
+            
+            return {'passed_filters': passed_filters, 'blocked_by_dedup': 0, 'sent_notifications': 1}
         
         except Exception as e:
             logger.error(f"Error processing market {market.get('slug', 'unknown')}: {e}")
+            return {}
     
     def _check_filters(self, market: Dict, spread: float, filters: List[Dict]) -> bool:
         """Проверить соответствие рынка фильтрам"""
@@ -999,13 +1028,17 @@ class AutoScanService:
             last_notification = await self.db.get_last_notification(user_id, market_slug)
             
             if last_notification is None:
+                logger.debug(f"Market {market_slug}: never notified before, will notify")
                 return True
             
             # Проверяем прошло ли достаточно времени
-            time_diff = datetime.now() - last_notification
+            time_diff = datetime.now(timezone.utc) - last_notification
             hours_passed = time_diff.total_seconds() / 3600
             
-            return hours_passed >= dedup_hours
+            should_notify = hours_passed >= dedup_hours
+            logger.debug(f"Market {market_slug}: last notified {hours_passed:.2f}h ago, dedup={dedup_hours}h, will_notify={should_notify}")
+            
+            return should_notify
         
         except Exception as e:
             logger.error(f"Error checking notification deduplication: {e}")
@@ -1029,7 +1062,7 @@ class AutoScanService:
             yes_price = float(outcome_prices[0]) if outcome_prices and len(outcome_prices) > 0 else 0
             no_price = float(outcome_prices[1]) if outcome_prices and len(outcome_prices) > 1 else 0
             
-            current_time = datetime.now().strftime("%H:%M:%S")
+            current_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
             
             # Формируем ссылку на маркет
             events = market.get("events", [])
