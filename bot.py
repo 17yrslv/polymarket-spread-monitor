@@ -47,6 +47,8 @@ AUTO_SCAN_INTERVAL = 60  # секунд (по умолчанию)
 AUTO_SCAN_DEDUP_HOURS = 1  # часов (по умолчанию)
 AUTO_SCAN_MAX_MARKETS = 1000  # максимум рынков для сканирования
 AUTO_SCAN_BATCH_SIZE = 50  # обрабатывать по N рынков параллельно
+AUTO_SCAN_MAX_PAGES = 10  # максимум страниц для сканирования (10 страниц = 10,000 рынков)
+AUTO_SCAN_PAGE_DELAY = 3  # задержка между страницами в секундах
 
 # ============================================================================
 # ЛОГИРОВАНИЕ
@@ -80,6 +82,8 @@ class PolymarketAPI:
         self._markets_cache = None
         self._cache_time = None
         self._cache_ttl = 300  # 5 минут
+        self._page_cache = {}  # Кэш для отдельных страниц
+        self._page_cache_ttl = 300  # 5 минут для каждой страницы
     
     async def fetch_with_retry(self, url: str, max_retries: int = 3) -> Optional[Dict]:
         """Выполнить HTTP запрос с retry логикой"""
@@ -99,6 +103,52 @@ class PolymarketAPI:
                 await asyncio.sleep(2 ** attempt)
         
         return None
+    
+    async def get_all_markets_paginated(self, page_size: int = 1000, max_pages: int = 10):
+        """Генератор для постраничной загрузки рынков с оптимизированным кэшированием"""
+        import time
+        
+        for page in range(max_pages):
+            offset = page * page_size
+            cache_key = f"page_{page}_{page_size}"
+            
+            # Проверка кэша страницы
+            if cache_key in self._page_cache:
+                cache_entry = self._page_cache[cache_key]
+                if time.time() - cache_entry['time'] < self._page_cache_ttl:
+                    logger.info(f"Using cached page {page + 1}/{max_pages}")
+                    data = cache_entry['data']
+                else:
+                    # Кэш устарел, удаляем
+                    del self._page_cache[cache_key]
+                    data = None
+            else:
+                data = None
+            
+            # Если нет в кэше, загружаем с API
+            if data is None:
+                logger.info(f"Fetching page {page + 1}/{max_pages} (offset={offset})...")
+                url = f"{self.BASE_URL}/markets?limit={page_size}&offset={offset}"
+                data = await self.fetch_with_retry(url)
+                
+                # Сохраняем в кэш
+                if data and isinstance(data, list):
+                    self._page_cache[cache_key] = {
+                        'data': data,
+                        'time': time.time()
+                    }
+            
+            if not data or not isinstance(data, list) or len(data) == 0:
+                logger.info(f"No more markets found at page {page + 1}, stopping pagination")
+                break
+            
+            logger.info(f"Loaded {len(data)} markets from page {page + 1}")
+            yield data
+            
+            # Если получили меньше рынков чем запрашивали - это последняя страница
+            if len(data) < page_size:
+                logger.info(f"Last page reached (got {len(data)} < {page_size})")
+                break
     
     async def get_all_markets(self, use_cache: bool = True) -> Optional[List[Dict]]:
         """Получить список всех рынков с кэшированием"""
@@ -248,6 +298,31 @@ class PolymarketAPI:
             logger.error(f"Error filtering markets by categories: {e}")
             return []
     
+    async def get_all_active_markets_stream(self, min_volume: float = 0, max_pages: int = 10):
+        """Генератор для потоковой загрузки активных рынков"""
+        try:
+            async for markets_page in self.get_all_markets_paginated(page_size=1000, max_pages=max_pages):
+                active_markets = []
+                
+                for market in markets_page:
+                    # Проверяем что рынок активен
+                    if market.get("closed") or market.get("archived"):
+                        continue
+                    
+                    # Проверяем минимальный объем
+                    volume = float(market.get("volume", 0))
+                    if volume < min_volume:
+                        continue
+                    
+                    active_markets.append(market)
+                
+                if active_markets:
+                    logger.info(f"Found {len(active_markets)} active markets in current page (min volume: ${min_volume:,.0f})")
+                    yield active_markets
+        
+        except Exception as e:
+            logger.error(f"Error in get_all_active_markets_stream: {e}")
+    
     async def get_all_active_markets(self, min_volume: float = 0, limit: int = AUTO_SCAN_MAX_MARKETS) -> List[Dict]:
         """Получить все активные рынки с минимальным объемом"""
         try:
@@ -361,6 +436,7 @@ class Database:
                     scan_mode TEXT DEFAULT 'all',
                     scan_interval INTEGER DEFAULT 60,
                     dedup_hours INTEGER DEFAULT 1,
+                    max_pages INTEGER DEFAULT 10,
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 )
             """)
@@ -393,6 +469,18 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_notification_history 
                 ON notification_history(user_id, market_slug, sent_at)
             """)
+            
+            # Миграция: добавить max_pages если его нет
+            try:
+                cursor = await db.execute("PRAGMA table_info(auto_scan_settings)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+                
+                if 'max_pages' not in column_names:
+                    await db.execute("ALTER TABLE auto_scan_settings ADD COLUMN max_pages INTEGER DEFAULT 10")
+                    logger.info("Migration: Added max_pages column to auto_scan_settings")
+            except Exception as e:
+                logger.error(f"Migration error: {e}")
             
             await db.commit()
         
@@ -509,7 +597,7 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             # Получить текущие настройки
             cursor = await db.execute(
-                "SELECT is_enabled, scan_mode, scan_interval, dedup_hours FROM auto_scan_settings WHERE user_id = ?",
+                "SELECT is_enabled, scan_mode, scan_interval, dedup_hours, max_pages FROM auto_scan_settings WHERE user_id = ?",
                 (user_id,)
             )
             row = await cursor.fetchone()
@@ -520,18 +608,20 @@ class Database:
                 scan_mode = kwargs.get('scan_mode', row[1])
                 scan_interval = kwargs.get('scan_interval', row[2])
                 dedup_hours = kwargs.get('dedup_hours', row[3])
+                max_pages = kwargs.get('max_pages', row[4] if len(row) > 4 else AUTO_SCAN_MAX_PAGES)
             else:
                 # Создать новые настройки с дефолтными значениями
                 is_enabled = kwargs.get('is_enabled', 0)
                 scan_mode = kwargs.get('scan_mode', 'all')
                 scan_interval = kwargs.get('scan_interval', 60)
                 dedup_hours = kwargs.get('dedup_hours', 1)
+                max_pages = kwargs.get('max_pages', AUTO_SCAN_MAX_PAGES)
             
             await db.execute(
                 """INSERT OR REPLACE INTO auto_scan_settings 
-                   (user_id, is_enabled, scan_mode, scan_interval, dedup_hours) 
-                   VALUES (?, ?, ?, ?, ?)""",
-                (user_id, is_enabled, scan_mode, scan_interval, dedup_hours)
+                   (user_id, is_enabled, scan_mode, scan_interval, dedup_hours, max_pages) 
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, is_enabled, scan_mode, scan_interval, dedup_hours, max_pages)
             )
             await db.commit()
     
@@ -540,7 +630,7 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT is_enabled, scan_mode, scan_interval, dedup_hours FROM auto_scan_settings WHERE user_id = ?",
+                "SELECT is_enabled, scan_mode, scan_interval, dedup_hours, max_pages FROM auto_scan_settings WHERE user_id = ?",
                 (user_id,)
             )
             row = await cursor.fetchone()
@@ -550,7 +640,8 @@ class Database:
                     'is_enabled': bool(row[0]),
                     'scan_mode': row[1],
                     'scan_interval': row[2],
-                    'dedup_hours': row[3]
+                    'dedup_hours': row[3],
+                    'max_pages': row[4] if len(row) > 4 else AUTO_SCAN_MAX_PAGES
                 }
             else:
                 # Вернуть дефолтные настройки
@@ -558,7 +649,8 @@ class Database:
                     'is_enabled': False,
                     'scan_mode': 'all',
                     'scan_interval': 60,
-                    'dedup_hours': 1
+                    'dedup_hours': 1,
+                    'max_pages': AUTO_SCAN_MAX_PAGES
                 }
     
     # ========================================================================
@@ -872,9 +964,18 @@ class AutoScanService:
                 scan_mode = settings.get('scan_mode', 'all')
                 scan_interval = settings.get('scan_interval', AUTO_SCAN_INTERVAL)
                 dedup_hours = settings.get('dedup_hours', AUTO_SCAN_DEDUP_HOURS)
+                max_pages = settings.get('max_pages', AUTO_SCAN_MAX_PAGES)
                 
                 # Получить фильтры
                 filters = await self.db.get_filters(user_id)
+                
+                # Счетчики для статистики
+                total_scanned = 0
+                passed_filters = 0
+                blocked_by_dedup = 0
+                sent_notifications = 0
+                
+                logger.info(f"Starting scan for user {user_id} (max_pages={max_pages})")
                 
                 # Загрузить рынки в зависимости от режима
                 if scan_mode == 'categories':
@@ -884,38 +985,57 @@ class AutoScanService:
                         await asyncio.sleep(scan_interval)
                         continue
                     
+                    # Для режима категорий используем старый метод (без пагинации)
                     markets = await self.api.get_markets_by_categories(categories)
-                else:  # scan_mode == 'all'
-                    markets = await self.api.get_all_active_markets(min_volume=0)
-                
-                if not markets:
-                    logger.warning(f"No markets to scan for user {user_id}")
-                    await asyncio.sleep(scan_interval)
-                    continue
-                
-                logger.info(f"Scanning {len(markets)} markets for user {user_id}")
-                
-                # Счетчики для статистики
-                passed_filters = 0
-                blocked_by_dedup = 0
-                sent_notifications = 0
-                
-                # Обрабатываем рынки батчами для оптимизации
-                for i in range(0, len(markets), AUTO_SCAN_BATCH_SIZE):
-                    batch = markets[i:i + AUTO_SCAN_BATCH_SIZE]
-                    stats = await self._process_batch(user_id, batch, filters, dedup_hours)
-                    passed_filters += stats.get('passed_filters', 0)
-                    blocked_by_dedup += stats.get('blocked_by_dedup', 0)
-                    sent_notifications += stats.get('sent_notifications', 0)
                     
-                    # Небольшая задержка между батчами чтобы не перегружать API
-                    if i + AUTO_SCAN_BATCH_SIZE < len(markets):
-                        await asyncio.sleep(1)
+                    if not markets:
+                        logger.warning(f"No markets to scan for user {user_id}")
+                        await asyncio.sleep(scan_interval)
+                        continue
+                    
+                    logger.info(f"Scanning {len(markets)} markets for user {user_id}")
+                    
+                    # Обрабатываем рынки батчами
+                    for i in range(0, len(markets), AUTO_SCAN_BATCH_SIZE):
+                        batch = markets[i:i + AUTO_SCAN_BATCH_SIZE]
+                        stats = await self._process_batch(user_id, batch, filters, dedup_hours)
+                        passed_filters += stats.get('passed_filters', 0)
+                        blocked_by_dedup += stats.get('blocked_by_dedup', 0)
+                        sent_notifications += stats.get('sent_notifications', 0)
+                        total_scanned += len(batch)
+                        
+                        if i + AUTO_SCAN_BATCH_SIZE < len(markets):
+                            await asyncio.sleep(1)
+                
+                else:  # scan_mode == 'all' - используем потоковую загрузку с пагинацией
+                    page_num = 0
+                    async for markets_page in self.api.get_all_active_markets_stream(min_volume=0, max_pages=max_pages):
+                        page_num += 1
+                        logger.info(f"Processing page {page_num} with {len(markets_page)} markets...")
+                        
+                        # Обрабатываем страницу батчами по 50
+                        for i in range(0, len(markets_page), AUTO_SCAN_BATCH_SIZE):
+                            batch = markets_page[i:i + AUTO_SCAN_BATCH_SIZE]
+                            stats = await self._process_batch(user_id, batch, filters, dedup_hours)
+                            
+                            # Обновляем счетчики
+                            passed_filters += stats.get('passed_filters', 0)
+                            blocked_by_dedup += stats.get('blocked_by_dedup', 0)
+                            sent_notifications += stats.get('sent_notifications', 0)
+                            total_scanned += len(batch)
+                            
+                            # Задержка между батчами
+                            await asyncio.sleep(0.5)
+                        
+                        logger.info(f"Page {page_num} processed: {total_scanned} total scanned, {sent_notifications} sent so far")
+                        
+                        # Задержка между страницами
+                        await asyncio.sleep(AUTO_SCAN_PAGE_DELAY)
                 
                 # Очистка старых уведомлений
                 await self.db.cleanup_old_notifications(days=7)
                 
-                logger.info(f"Scan completed for user {user_id}: {len(markets)} markets scanned, {passed_filters} passed filters, {blocked_by_dedup} blocked by dedup, {sent_notifications} notifications sent, sleeping for {scan_interval}s")
+                logger.info(f"Scan completed for user {user_id}: {total_scanned} markets scanned, {passed_filters} passed filters, {blocked_by_dedup} blocked by dedup, {sent_notifications} notifications sent, sleeping for {scan_interval}s")
                 await asyncio.sleep(scan_interval)
             
             except asyncio.CancelledError:
@@ -1202,11 +1322,12 @@ async def cmd_help(message: Message):
         
         "🤖 АВТОСКАНИРОВАНИЕ\n"
         "/auto_scan_start - запустить автосканирование\n"
-        "/auto_scan_stop - остановить автосканирование\n"
-        "/auto_scan_status - показать статус автосканирования\n"
-        "/auto_scan_mode <all|categories> - установить режим сканирования\n"
-        "/auto_scan_interval <секунды> - установить интервал сканирования\n"
-        "/auto_scan_dedup <часы> - установить время дедупликации\n\n"
+         "/auto_scan_stop - остановить автосканирование\n"
+         "/auto_scan_status - показать статус автосканирования\n"
+         "/auto_scan_mode <all|categories> - установить режим сканирования\n"
+         "/auto_scan_interval <секунды> - установить интервал сканирования\n"
+         "/auto_scan_dedup <часы> - установить время дедупликации\n"
+         "/auto_scan_pages <количество> - установить количество страниц для сканирования (1-100, каждая = 1000 рынков)\n\n"
         
         "📁 КАТЕГОРИИ (для режима categories)\n"
         "/categories - показать доступные категории\n"
@@ -1631,6 +1752,7 @@ async def cmd_auto_scan_status(message: Message, db: Database):
         f"• Режим: {mode}\n"
         f"• Интервал: {settings['scan_interval']} сек\n"
         f"• Дедупликация: {settings['dedup_hours']} ч\n"
+        f"• Страниц для сканирования: {settings.get('max_pages', AUTO_SCAN_MAX_PAGES)} ({settings.get('max_pages', AUTO_SCAN_MAX_PAGES) * 1000} рынков)\n"
         f"• Фильтров: {len(filters)}\n"
     )
     
@@ -1736,6 +1858,46 @@ async def cmd_auto_scan_dedup(message: Message, db: Database):
     
     except ValueError:
         await message.answer("❌ Неверное значение. Укажите число часов")
+
+@router.message(Command("auto_scan_pages"))
+async def cmd_auto_scan_pages(message: Message, db: Database):
+    """Обработчик команды /auto_scan_pages"""
+    user_id = message.from_user.id
+    
+    if user_id != ALLOWED_USER_ID:
+        await message.answer("❌ Access denied")
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        settings = await db.get_auto_scan_settings(user_id)
+        current_pages = settings.get('max_pages', AUTO_SCAN_MAX_PAGES)
+        await message.answer(
+            "❌ Использование: /auto_scan_pages <количество_страниц>\n\n"
+            f"Текущее значение: {current_pages} страниц ({current_pages * 1000} рынков)\n\n"
+            "Примеры:\n"
+            "/auto_scan_pages 5 - сканировать 5,000 рынков\n"
+            "/auto_scan_pages 10 - сканировать 10,000 рынков\n"
+            "/auto_scan_pages 20 - сканировать 20,000 рынков\n\n"
+            "Каждая страница содержит 1,000 рынков"
+        )
+        return
+    
+    try:
+        pages = int(args[1])
+        if pages < 1:
+            await message.answer("❌ Количество страниц должно быть не менее 1")
+            return
+        
+        if pages > 100:
+            await message.answer("❌ Максимум 100 страниц (100,000 рынков)")
+            return
+        
+        await db.set_auto_scan_settings(user_id, max_pages=pages)
+        await message.answer(f"✅ Количество страниц установлено: {pages} ({pages * 1000} рынков)")
+    
+    except ValueError:
+        await message.answer("❌ Неверное значение. Укажите число страниц")
 
 @router.message(Command("categories"))
 async def cmd_categories(message: Message, api: PolymarketAPI):
