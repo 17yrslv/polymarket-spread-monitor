@@ -44,9 +44,9 @@ MONITORING_INTERVAL = 10  # секунд
 AUTO_SCAN_INTERVAL = 60  # секунд (по умолчанию)
 AUTO_SCAN_DEDUP_HOURS = 1  # часов (по умолчанию)
 AUTO_SCAN_MAX_MARKETS = 1000  # максимум рынков для сканирования
-AUTO_SCAN_BATCH_SIZE = 50  # обрабатывать по N рынков параллельно
-AUTO_SCAN_MAX_PAGES = 10  # максимум страниц для сканирования (10 страниц = 10,000 рынков)
-AUTO_SCAN_PAGE_DELAY = 3  # задержка между страницами в секундах
+AUTO_SCAN_BATCH_SIZE = 100  # обрабатывать по N рынков параллельно (увеличено для оптимизации)
+AUTO_SCAN_MAX_PAGES = 30  # максимум страниц для сканирования (30 страниц = 30,000 рынков)
+AUTO_SCAN_PAGE_DELAY = 2  # задержка между страницами в секундах (безопасное значение)
 
 # ============================================================================
 # ЛОГИРОВАНИЕ
@@ -90,6 +90,12 @@ class PolymarketAPI:
                 async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                     if resp.status == 200:
                         return await resp.json()
+                    elif resp.status == 429:
+                        # Rate limit - ждем и повторяем
+                        wait_time = 10 * (attempt + 1)  # Увеличиваем время ожидания с каждой попыткой
+                        logger.warning(f"Rate limit (429) for {url}, waiting {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                        continue
                     else:
                         logger.warning(f"API returned status {resp.status} for {url}")
             except asyncio.TimeoutError:
@@ -372,6 +378,59 @@ class PolymarketAPI:
         except Exception as e:
             logger.error(f"Error getting unique categories: {e}")
             return []
+    
+    async def get_trade_frequency(self, condition_id: str, period_minutes: int, db: 'Database') -> int:
+        """Получить количество сделок за последние N минут
+        
+        Args:
+            condition_id: ID рынка (conditionId)
+            period_minutes: Период в минутах (1-10)
+            db: Database instance для кэширования
+        
+        Returns:
+            Количество сделок за период
+        """
+        import time
+        
+        try:
+            # Проверяем кэш
+            cached = await db.get_trade_frequency_cache(condition_id, period_minutes)
+            if cached is not None:
+                logger.debug(f"Using cached trade frequency for {condition_id}: {cached}")
+                return cached
+            
+            # Запрашиваем сделки из API
+            url = f"https://data-api.polymarket.com/trades?market={condition_id}&limit=1000"
+            data = await self.fetch_with_retry(url)
+            
+            if not data or not isinstance(data, list):
+                logger.warning(f"No trade data for condition_id {condition_id}")
+                return 0
+            
+            # Подсчитываем сделки за последние N минут
+            current_time = time.time()
+            period_seconds = period_minutes * 60
+            cutoff_time = current_time - period_seconds
+            
+            trade_count = 0
+            for trade in data:
+                timestamp = trade.get("timestamp", 0)
+                # timestamp уже в секундах (Unix timestamp)
+                if isinstance(timestamp, int) and timestamp > 0:
+                    trade_time = timestamp
+                    if trade_time >= cutoff_time:
+                        trade_count += 1
+            
+            logger.info(f"Found {trade_count} trades in last {period_minutes} minutes for {condition_id}")
+            
+            # Сохраняем в кэш
+            await db.save_trade_frequency_cache(condition_id, trade_count, period_minutes)
+            
+            return trade_count
+        
+        except Exception as e:
+            logger.error(f"Error getting trade frequency for {condition_id}: {e}")
+            return 0
 
 # ============================================================================
 # DATABASE
@@ -468,6 +527,16 @@ class Database:
                 ON notification_history(user_id, market_slug, sent_at)
             """)
             
+            # Кэш частоты сделок
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS trade_frequency_cache (
+                    condition_id TEXT PRIMARY KEY,
+                    last_check TIMESTAMP NOT NULL,
+                    trade_count INTEGER NOT NULL,
+                    period_minutes INTEGER NOT NULL
+                )
+            """)
+            
             # Миграция: добавить max_pages если его нет
             try:
                 cursor = await db.execute("PRAGMA table_info(auto_scan_settings)")
@@ -551,18 +620,28 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT filter_type, filter_value FROM filters WHERE user_id = ?",
+                "SELECT id, filter_type, filter_value FROM filters WHERE user_id = ?",
                 (user_id,)
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
     
     async def clear_filter(self, user_id: int, filter_type: str) -> bool:
-        """Удалить фильтр"""
+        """Удалить фильтр по типу"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "DELETE FROM filters WHERE user_id = ? AND filter_type = ?",
                 (user_id, filter_type)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+    
+    async def remove_filter(self, user_id: int, filter_id: int) -> bool:
+        """Удалить фильтр по ID"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM filters WHERE user_id = ? AND id = ?",
+                (user_id, filter_id)
             )
             await db.commit()
             return cursor.rowcount > 0
@@ -758,6 +837,48 @@ class Database:
                 logger.info(f"Cleaned up notifications older than {days} days")
             except Exception as e:
                 logger.error(f"Error cleaning up notifications: {e}")
+    
+    # ========================================================================
+    # TRADE FREQUENCY CACHE
+    # ========================================================================
+    
+    async def get_trade_frequency_cache(self, condition_id: str, period_minutes: int) -> Optional[int]:
+        """Получить закэшированную частоту сделок"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                cursor = await db.execute(
+                    """SELECT trade_count, last_check FROM trade_frequency_cache 
+                       WHERE condition_id = ? AND period_minutes = ?""",
+                    (condition_id, period_minutes)
+                )
+                row = await cursor.fetchone()
+                
+                if row:
+                    trade_count, last_check_str = row
+                    last_check = datetime.fromisoformat(last_check_str).replace(tzinfo=timezone.utc)
+                    
+                    # Кэш валиден 5 минут (300 секунд) - увеличено для оптимизации
+                    if datetime.now(timezone.utc) - last_check < timedelta(seconds=300):
+                        return trade_count
+                
+                return None
+            except Exception as e:
+                logger.error(f"Error getting trade frequency cache: {e}")
+                return None
+    
+    async def save_trade_frequency_cache(self, condition_id: str, trade_count: int, period_minutes: int):
+        """Сохранить частоту сделок в кэш"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute(
+                    """INSERT OR REPLACE INTO trade_frequency_cache 
+                       (condition_id, last_check, trade_count, period_minutes) 
+                       VALUES (?, ?, ?, ?)""",
+                    (condition_id, datetime.now(timezone.utc).isoformat(), trade_count, period_minutes)
+                )
+                await db.commit()
+            except Exception as e:
+                logger.error(f"Error saving trade frequency cache: {e}")
 
 # ============================================================================
 # MONITORING SERVICE
@@ -811,7 +932,7 @@ class MonitoringService:
                         
                         spread, outcome = self.api.calculate_spread(data)
                         
-                        if self._check_filters(data, spread, filters):
+                        if await self._check_filters(data, spread, filters):
                             await self._send_notification(user_id, data, spread, outcome)
                     
                     except Exception as e:
@@ -826,7 +947,7 @@ class MonitoringService:
                 logger.error(f"Error in monitoring loop: {e}")
                 await asyncio.sleep(MONITORING_INTERVAL)
     
-    def _check_filters(self, data: Dict, spread: float, filters: List[Dict]) -> bool:
+    async def _check_filters(self, data: Dict, spread: float, filters: List[Dict]) -> bool:
         """Проверить соответствие данных фильтрам"""
         if not filters:
             return True
@@ -857,6 +978,17 @@ class MonitoringService:
                     if outcome_prices and len(outcome_prices) > 0:
                         yes_price = float(outcome_prices[0])
                         if not (min_price <= yes_price <= max_price):
+                            return False
+                
+                elif filter_type == "trade_frequency_min":
+                    # Формат: "количество,период_минут"
+                    min_trades, period_minutes = map(int, filter_value.split(","))
+                    condition_id = data.get("conditionId", "")
+                    
+                    if condition_id:
+                        trade_count = await self.api.get_trade_frequency(condition_id, period_minutes, self.db)
+                        if trade_count < min_trades:
+                            logger.debug(f"Market {condition_id} filtered: {trade_count} < {min_trades} trades in {period_minutes}min")
                             return False
             
             except (ValueError, TypeError, IndexError) as e:
@@ -992,8 +1124,8 @@ class AutoScanService:
                         sent_notifications += stats.get('sent_notifications', 0)
                         total_scanned += len(batch)
                         
-                        # Задержка между батчами
-                        await asyncio.sleep(0.5)
+                        # Задержка между батчами (безопасное значение для API)
+                        await asyncio.sleep(0.3)
                     
                     logger.info(f"Page {page_num} processed: {total_scanned} total scanned, {sent_notifications} sent so far")
                     
@@ -1048,9 +1180,24 @@ class AutoScanService:
             # Рассчитываем спред
             spread, outcome = self.api.calculate_spread(market)
             
-            # Проверяем фильтры
+            # Проверяем базовые фильтры (синхронные)
             if not self._check_filters(market, spread, filters):
                 return {}
+            
+            # Проверяем фильтр частоты сделок (асинхронный)
+            for filter_item in filters:
+                if filter_item["filter_type"] == "trade_frequency_min":
+                    try:
+                        min_trades, period_minutes = map(int, filter_item["filter_value"].split(","))
+                        condition_id = market.get("conditionId", "")
+                        
+                        if condition_id:
+                            trade_count = await self.api.get_trade_frequency(condition_id, period_minutes, self.db)
+                            if trade_count < min_trades:
+                                logger.debug(f"Market {market_slug} filtered: {trade_count} < {min_trades} trades in {period_minutes}min")
+                                return {}
+                    except Exception as e:
+                        logger.error(f"Error checking trade frequency filter: {e}")
             
             # Рынок прошел фильтры
             passed_filters = 1
@@ -1103,6 +1250,8 @@ class AutoScanService:
                         yes_price = float(outcome_prices[0])
                         if not (min_price <= yes_price <= max_price):
                             return False
+                
+                # Примечание: trade_frequency_min проверяется асинхронно в _process_market
             
             return True
         
@@ -1259,8 +1408,12 @@ async def cmd_help(message: Message):
         
         "🎯 ФИЛЬТРЫ\n"
         "/set_filter <type> <value> - установить фильтр\n"
-        "  Типы: min_spread, max_spread, min_volume, max_volume, min_liquidity\n"
-        "  Пример: /set_filter min_spread 5\n"
+        "  Типы: spread_min, volume_min, yes_price_between, trade_frequency_min\n"
+        "  Примеры:\n"
+        "    /set_filter spread_min 5\n"
+        "    /set_filter volume_min 100000\n"
+        "    /set_filter yes_price_between 0.4 0.6\n"
+        "    /set_filter trade_frequency_min 10 5\n"
         "/filters - показать активные фильтры\n"
         "/remove_filter <id> - удалить фильтр по ID\n\n"
         
@@ -1416,11 +1569,13 @@ async def cmd_set_filter(message: Message, db: Database):
             "❌ Использование:\n"
             "/set_filter spread_min <значение>\n"
             "/set_filter volume_min <значение>\n"
-            "/set_filter yes_price_between <min> <max>\n\n"
+            "/set_filter yes_price_between <min> <max>\n"
+            "/set_filter trade_frequency_min <количество> <период_минут>\n\n"
             "Примеры:\n"
             "/set_filter spread_min 1.5\n"
             "/set_filter volume_min 500000\n"
-            "/set_filter yes_price_between 0.4 0.6"
+            "/set_filter yes_price_between 0.4 0.6\n"
+            "/set_filter trade_frequency_min 10 5"
         )
         return
     
@@ -1431,11 +1586,28 @@ async def cmd_set_filter(message: Message, db: Database):
             await message.answer("❌ Для yes_price_between нужно указать min и max значения")
             return
         filter_value = f"{args[2]},{args[3]}"
+    elif filter_type == "trade_frequency_min":
+        if len(args) < 4:
+            await message.answer("❌ Для trade_frequency_min нужно указать количество сделок и период в минутах")
+            return
+        try:
+            min_trades = int(args[2])
+            period_minutes = int(args[3])
+            if period_minutes < 1 or period_minutes > 10:
+                await message.answer("❌ Период должен быть от 1 до 10 минут")
+                return
+            if min_trades < 1:
+                await message.answer("❌ Количество сделок должно быть больше 0")
+                return
+            filter_value = f"{min_trades},{period_minutes}"
+        except ValueError:
+            await message.answer("❌ Неверный формат. Используйте целые числа")
+            return
     else:
         filter_value = args[2]
     
-    if filter_type not in ["spread_min", "volume_min", "yes_price_between"]:
-        await message.answer("❌ Неизвестный тип фильтра. Доступные: spread_min, volume_min, yes_price_between")
+    if filter_type not in ["spread_min", "volume_min", "yes_price_between", "trade_frequency_min"]:
+        await message.answer("❌ Неизвестный тип фильтра. Доступные: spread_min, volume_min, yes_price_between, trade_frequency_min")
         return
     
     await db.set_filter(user_id, filter_type, filter_value)
@@ -1447,6 +1619,9 @@ async def cmd_set_filter(message: Message, db: Database):
     elif filter_type == "yes_price_between":
         min_val, max_val = filter_value.split(",")
         await message.answer(f"✅ Фильтр установлен: цена Yes между {min_val} и {max_val}")
+    elif filter_type == "trade_frequency_min":
+        min_trades, period_minutes = filter_value.split(",")
+        await message.answer(f"✅ Фильтр установлен: минимум {min_trades} сделок за {period_minutes} минут")
 
 @router.message(Command("filters"))
 async def cmd_filters(message: Message, db: Database):
@@ -1478,6 +1653,9 @@ async def cmd_filters(message: Message, db: Database):
         elif filter_type == "yes_price_between":
             min_val, max_val = filter_value.split(",")
             text += f"ID {filter_id}: Цена Yes: между {min_val} и {max_val}\n"
+        elif filter_type == "trade_frequency_min":
+            min_trades, period_minutes = filter_value.split(",")
+            text += f"ID {filter_id}: Минимум {min_trades} сделок за {period_minutes} мин\n"
         
         # Добавляем кнопку для удаления каждого фильтра
         buttons.append([InlineKeyboardButton(
@@ -1922,8 +2100,22 @@ async def callback_remove_filter(callback: CallbackQuery, db: Database):
                 text = "🎯 Активные фильтры:\n\n"
                 buttons = []
                 
-                for fid, ftype, fvalue in filters:
-                    text += f"ID {fid}: {ftype} = {fvalue}\n"
+                for filter_item in filters:
+                    fid = filter_item["id"]
+                    ftype = filter_item["filter_type"]
+                    fvalue = filter_item["filter_value"]
+                    
+                    if ftype == "spread_min":
+                        text += f"ID {fid}: Минимальный спред: {fvalue}%\n"
+                    elif ftype == "volume_min":
+                        text += f"ID {fid}: Минимальный объём: ${fvalue}\n"
+                    elif ftype == "yes_price_between":
+                        min_val, max_val = fvalue.split(",")
+                        text += f"ID {fid}: Цена Yes: между {min_val} и {max_val}\n"
+                    elif ftype == "trade_frequency_min":
+                        min_trades, period_minutes = fvalue.split(",")
+                        text += f"ID {fid}: Минимум {min_trades} сделок за {period_minutes} мин\n"
+                    
                     buttons.append([InlineKeyboardButton(
                         text=f"🗑️ Удалить фильтр {fid}",
                         callback_data=f"remove_filter:{fid}"
@@ -1955,8 +2147,8 @@ async def callback_clear_all_filters(callback: CallbackQuery, db: Database):
     try:
         filters = await db.get_filters(user_id)
         
-        for filter_id, _, _ in filters:
-            await db.remove_filter(user_id, filter_id)
+        for filter_item in filters:
+            await db.remove_filter(user_id, filter_item["id"])
         
         await callback.answer("✅ Все фильтры удалены", show_alert=True)
         await callback.message.edit_text(
